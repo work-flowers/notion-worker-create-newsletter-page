@@ -11,6 +11,8 @@
  *      from that Markdown, and relates it back to the triggering blog page.
  *   3. Copies the blog page's cover onto the new Newsletter page (re-hosting
  *      Notion-hosted file covers so the URL doesn't expire).
+ *   4. Re-hosts the body images (Markdown import drops them) and patches each
+ *      onto the matching image block on the new page.
  *
  * All calls use the latest data APIs at Notion-Version 2026-03-11 via raw
  * fetch, because the bundled SDK defaults to an older version that doesn't
@@ -286,6 +288,131 @@ async function buildCover(
 }
 
 // ---------------------------------------------------------------------------
+// Body images
+//
+// Creating a page from Markdown does NOT carry over images: Notion discards the
+// source's expiring S3 URLs, leaving empty image blocks. We fix that by walking
+// the source and the new page's block trees in parallel, re-hosting each source
+// image via the File Upload API and patching it onto the matching image block on
+// the new page — which preserves position, even inside columns.
+// ---------------------------------------------------------------------------
+
+interface NotionBlock {
+	id: string;
+	type: string;
+	has_children?: boolean;
+	image?: {
+		type?: "file" | "external" | "file_upload";
+		file?: { url: string };
+		external?: { url: string };
+	};
+}
+
+interface SourceImage {
+	kind: "file" | "external";
+	url: string;
+}
+
+/** All direct children of a block/page, following pagination. */
+async function listChildren(
+	token: string,
+	blockId: string,
+): Promise<NotionBlock[]> {
+	const blocks: NotionBlock[] = [];
+	let cursor: string | undefined;
+	do {
+		const qs = new URLSearchParams({ page_size: "100" });
+		if (cursor) qs.set("start_cursor", cursor);
+		const res = await notionRequest<{
+			results: NotionBlock[];
+			has_more: boolean;
+			next_cursor: string | null;
+		}>(token, "GET", `/blocks/${blockId}/children?${qs.toString()}`);
+		blocks.push(...res.results);
+		cursor = res.has_more ? (res.next_cursor ?? undefined) : undefined;
+	} while (cursor);
+	return blocks;
+}
+
+/** Image blocks under a block, in document order (descends into children). */
+async function collectSourceImages(
+	token: string,
+	blockId: string,
+): Promise<SourceImage[]> {
+	const out: SourceImage[] = [];
+	for (const block of await listChildren(token, blockId)) {
+		if (block.type === "image") {
+			const img = block.image;
+			if (img?.type === "external" && img.external?.url) {
+				out.push({ kind: "external", url: img.external.url });
+			} else {
+				out.push({ kind: "file", url: img?.file?.url ?? "" });
+			}
+		} else if (block.has_children) {
+			out.push(...(await collectSourceImages(token, block.id)));
+		}
+	}
+	return out;
+}
+
+/** Image block ids under a block, in the same document order. */
+async function collectImageBlockIds(
+	token: string,
+	blockId: string,
+): Promise<string[]> {
+	const out: string[] = [];
+	for (const block of await listChildren(token, blockId)) {
+		if (block.type === "image") {
+			out.push(block.id);
+		} else if (block.has_children) {
+			out.push(...(await collectImageBlockIds(token, block.id)));
+		}
+	}
+	return out;
+}
+
+/**
+ * Copy the source page's body images onto the freshly created page by matching
+ * them positionally and re-hosting Notion-hosted files. Best-effort: per-image
+ * failures are logged, not thrown (the page itself already exists).
+ */
+async function copyBodyImages(
+	token: string,
+	sourcePageId: string,
+	newPageId: string,
+): Promise<void> {
+	const sources = await collectSourceImages(token, sourcePageId);
+	if (sources.length === 0) return;
+
+	const targetIds = await collectImageBlockIds(token, newPageId);
+	const count = Math.min(sources.length, targetIds.length);
+	if (sources.length !== targetIds.length) {
+		console.warn(
+			`Body image count mismatch (source ${sources.length}, created ${targetIds.length}); copying first ${count}.`,
+		);
+	}
+
+	for (let i = 0; i < count; i++) {
+		const src = sources[i];
+		const blockId = targetIds[i];
+		if (!src.url) continue;
+		try {
+			const media =
+				src.kind === "external"
+					? { external: { url: src.url } }
+					: { file_upload: { id: await rehostFile(token, src.url) } };
+			await notionRequest(token, "PATCH", `/blocks/${blockId}`, {
+				image: media,
+			});
+		} catch (err) {
+			console.warn(
+				`Failed to copy body image ${i} -> block ${blockId}: ${String(err)}`,
+			);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Worker
 // ---------------------------------------------------------------------------
 
@@ -388,6 +515,18 @@ worker.webhook("onCreateNewsletter", {
 			console.log(
 				`Created Newsletter page ${created.id} for blog ${blogPageId} ("${title}").`,
 			);
+
+			// 5. Copy body images. The Markdown import drops them, so re-host
+			//    each source image and patch it onto the matching image block.
+			//    Best-effort: never fail the run over images (the page exists,
+			//    and a retry would be skipped by the idempotency guard).
+			try {
+				await copyBodyImages(token, blogPageId, created.id);
+			} catch (err) {
+				console.warn(
+					`Body image copy failed for ${created.id}: ${String(err)}`,
+				);
+			}
 		}
 	},
 });

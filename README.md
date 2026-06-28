@@ -18,6 +18,11 @@ For each incoming webhook event (payload must carry the triggering blog
 4. **Copies** the blog page's cover onto the new page. Notion-hosted file covers
    are re-uploaded via the File Upload API so the new cover doesn't point at an
    expiring signed URL; external covers are copied as-is.
+5. **Restores body images.** The Markdown import drops images (Notion won't store
+   the source's expiring S3 URLs, leaving empty image blocks). The worker walks
+   the source and new pages' block trees in parallel, re-hosts each image via the
+   File Upload API, and patches it onto the matching image block — preserving
+   position, including inside columns.
 
 All calls use Notion data API version **`2026-03-11`** via raw `fetch` (the
 bundled SDK pins an older version that lacks the Markdown/data-source endpoints).
