@@ -23,6 +23,13 @@ For each incoming webhook event (payload must carry the triggering blog
    the source and new pages' block trees in parallel, re-hosts each image via the
    File Upload API, and patches it onto the matching image block — preserving
    position, including inside columns.
+6. **Applies the default template.** The Notion API does not run data-source page
+   templates on create, so the worker copies the Newsletter Issues default
+   template's blocks onto the new page, appended **after** the blog content
+   (generic block clone: strips read-only fields, re-hosts media, preserves
+   nesting). The template page id is `NEWSLETTER_TEMPLATE_PAGE_ID` in
+   `src/index.ts` — update it if the data source's default template changes. Only
+   the template's **blocks** are copied, not its preset properties (e.g. Status).
 
 All calls use Notion data API version **`2026-03-11`** via raw `fetch` (the
 bundled SDK pins an older version that lacks the Markdown/data-source endpoints).

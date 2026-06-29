@@ -13,6 +13,8 @@
  *      Notion-hosted file covers so the URL doesn't expire).
  *   4. Re-hosts the body images (Markdown import drops them) and patches each
  *      onto the matching image block on the new page.
+ *   5. Appends the Newsletter data source's default template blocks after the
+ *      blog content (the API does not run data-source templates on create).
  *
  * All calls use the latest data APIs at Notion-Version 2026-03-11 via raw
  * fetch, because the bundled SDK defaults to an older version that doesn't
@@ -39,6 +41,14 @@ const BLOG_TITLE_PROP = "Post Title";
 const NEWSLETTER_TITLE_PROP = "Name";
 /** Relation (Newsletter Issues -> Blog) used to link the two pages. */
 const BLOG_RELATION_PROP = "Blog post";
+
+/**
+ * Default page template for the Newsletter Issues data source. The Notion API
+ * does not run data-source templates on create, so we copy this template's
+ * blocks onto the new page (after the blog content). Update this id if the data
+ * source's default template changes.
+ */
+const NEWSLETTER_TEMPLATE_PAGE_ID = "33791b07-11ac-809f-be48-f78827e4f8ca";
 
 const NOTION_API = "https://api.notion.com/v1";
 const NOTION_VERSION = "2026-03-11";
@@ -306,6 +316,7 @@ interface NotionBlock {
 		file?: { url: string };
 		external?: { url: string };
 	};
+	[key: string]: unknown;
 }
 
 interface SourceImage {
@@ -409,6 +420,112 @@ async function copyBodyImages(
 				`Failed to copy body image ${i} -> block ${blockId}: ${String(err)}`,
 			);
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Template
+//
+// The Notion API does not run data-source page templates on create, so we copy
+// the default template's blocks onto the new page after the blog content. This
+// is a generic block clone: it strips read-only fields, re-hosts Notion-hosted
+// media, and preserves nesting (e.g. column layouts).
+// ---------------------------------------------------------------------------
+
+/** Block types we can't faithfully recreate via the API — skipped on copy. */
+const UNSUPPORTED_BLOCKS = new Set([
+	"child_page",
+	"child_database",
+	"unsupported",
+	"ai_block",
+	"link_to_page",
+	"synced_block",
+	"template",
+]);
+
+/** File-backed block types whose Notion-hosted media must be re-hosted. */
+const MEDIA_BLOCKS = new Set(["image", "file", "video", "pdf"]);
+
+/** Drop read-only fields (`plain_text`, `href`) from a rich_text array. */
+function stripReadOnlyRichText(value: unknown): unknown {
+	if (!Array.isArray(value)) return value;
+	return value.map((item) => {
+		if (item && typeof item === "object") {
+			const { plain_text, href, ...rest } = item as Record<string, unknown>;
+			return rest;
+		}
+		return item;
+	});
+}
+
+/**
+ * Turn a fetched block into a create payload: keep the type-specific data, strip
+ * read-only fields, re-host Notion-hosted media, and recurse into children.
+ * Returns null for block types we skip.
+ */
+async function cloneBlock(
+	token: string,
+	block: NotionBlock,
+): Promise<Record<string, unknown> | null> {
+	const type = block.type;
+	if (UNSUPPORTED_BLOCKS.has(type)) return null;
+
+	const data: Record<string, unknown> = {
+		...((block[type] as Record<string, unknown> | undefined) ?? {}),
+	};
+	if ("rich_text" in data) data.rich_text = stripReadOnlyRichText(data.rich_text);
+	if ("caption" in data) data.caption = stripReadOnlyRichText(data.caption);
+
+	// Re-host Notion-hosted media so the copy doesn't point at an expiring URL.
+	if (MEDIA_BLOCKS.has(type) && data.type === "file") {
+		const url = (data.file as { url?: string } | undefined)?.url;
+		if (url) {
+			try {
+				const id = await rehostFile(token, url);
+				delete data.file;
+				data.type = "file_upload";
+				data.file_upload = { id };
+			} catch (err) {
+				console.warn(`Template media re-host failed: ${String(err)}`);
+				delete data.file;
+				data.type = "external";
+				data.external = { url };
+			}
+		}
+	}
+
+	if (block.has_children) {
+		const cloned: Record<string, unknown>[] = [];
+		for (const child of await listChildren(token, block.id)) {
+			const c = await cloneBlock(token, child);
+			if (c) cloned.push(c);
+		}
+		if (cloned.length > 0) data.children = cloned;
+	}
+
+	return { object: "block", type, [type]: data };
+}
+
+/**
+ * Copy the template page's blocks onto the new page. Appends at the end, so the
+ * blog content (already the page body) stays before the template blocks.
+ */
+async function applyTemplate(
+	token: string,
+	templatePageId: string,
+	newPageId: string,
+): Promise<void> {
+	const children: Record<string, unknown>[] = [];
+	for (const block of await listChildren(token, templatePageId)) {
+		const c = await cloneBlock(token, block);
+		if (c) children.push(c);
+	}
+	if (children.length === 0) return;
+
+	for (let i = 0; i < children.length; i += 100) {
+		await notionRequest(token, "PATCH", `/blocks/${newPageId}/children`, {
+			children: children.slice(i, i + 100),
+		});
 	}
 }
 
@@ -525,6 +642,16 @@ worker.webhook("onCreateNewsletter", {
 			} catch (err) {
 				console.warn(
 					`Body image copy failed for ${created.id}: ${String(err)}`,
+				);
+			}
+
+			// 6. Append the Newsletter template's blocks after the blog content.
+			//    The API can't run data-source templates, so we copy them in.
+			try {
+				await applyTemplate(token, NEWSLETTER_TEMPLATE_PAGE_ID, created.id);
+			} catch (err) {
+				console.warn(
+					`Applying template to ${created.id} failed: ${String(err)}`,
 				);
 			}
 		}
